@@ -5,16 +5,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from PIL import Image
 import io
-import tempfile
 import os
-
-# Try importing rasterio; if not available, fallback to PIL-only
-try:
-    import rasterio
-    from rasterio.plot import show
-    RASTERIO_AVAILABLE = True
-except ImportError:
-    RASTERIO_AVAILABLE = False
 
 st.set_page_config(
     page_title="Satellite Image Analyzer",
@@ -44,11 +35,11 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.markdown('<p class="main-header">🛰️ Satellite Image Analysis Dashboard</p>', unsafe_allow_html=True)
-st.markdown("Upload satellite imagery (GeoTIFF, PNG, JPG) to extract insights, statistics, and visualizations instantly.")
+st.markdown("Upload satellite imagery (PNG, JPG, TIFF) to extract insights, statistics, and visualizations.")
 
 # Sidebar
 st.sidebar.header("⚙️ Settings")
-st.sidebar.markdown("---")
+st.sidebar.info("This app runs on Streamlit Cloud using only pure Python packages (no GDAL required).")
 
 # File Uploader
 uploaded_file = st.file_uploader(
@@ -59,64 +50,30 @@ uploaded_file = st.file_uploader(
 
 @st.cache_data(show_spinner=False)
 def load_image(uploaded_file):
-    """Load image and return array + metadata."""
+    """Load image using PIL only — works everywhere including Streamlit Cloud."""
     file_bytes = uploaded_file.read()
-    file_ext = os.path.splitext(uploaded_file.name)[1].lower()
-    
-    # Try rasterio first for geospatial files
-    if RASTERIO_AVAILABLE and file_ext in ['.tif', '.tiff']:
-        try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmpfile:
-                tmpfile.write(file_bytes)
-                tmp_path = tmpfile.name
-            
-            with rasterio.open(tmp_path) as src:
-                img_array = src.read()  # Shape: (bands, height, width)
-                meta = src.meta
-                bounds = src.bounds
-                crs = src.crs.to_string() if src.crs else "Not specified"
-            
-            os.unlink(tmp_path)
-            
-            # Rearrange to (height, width, bands) for display
-            if img_array.shape[0] in [1, 3, 4]:
-                img_display = np.transpose(img_array, (1, 2, 0))
-            else:
-                img_display = np.transpose(img_array, (1, 2, 0))
-                
-            return {
-                'array': img_array,  # (bands, h, w)
-                'display': img_display,  # (h, w, bands)
-                'meta': meta,
-                'bounds': bounds,
-                'crs': crs,
-                'source': 'rasterio',
-                'name': uploaded_file.name
-            }
-        except Exception as e:
-            st.warning(f"Rasterio failed ({e}), falling back to PIL...")
-    
-    # Fallback to PIL
     image = Image.open(io.BytesIO(file_bytes))
+    
+    # Convert to numpy array
     img_array = np.array(image)
     
     # Ensure shape is (bands, h, w)
     if len(img_array.shape) == 2:
+        # Grayscale
         img_array = img_array[np.newaxis, :, :]  # (1, h, w)
-        img_display = np.repeat(img_array, 3, axis=0)
-        img_display = np.transpose(img_display, (1, 2, 0))
-    else:
+        img_display = np.stack([img_array[0]] * 3, axis=-1)  # (h, w, 3)
+    elif len(img_array.shape) == 3:
+        # Color image (h, w, bands)
+        img_display = img_array
         img_array = np.transpose(img_array, (2, 0, 1))  # (bands, h, w)
-        img_display = np.array(image)
+    else:
+        raise ValueError("Unsupported image dimensions")
     
     return {
-        'array': img_array,
-        'display': img_display,
-        'meta': {'driver': 'PIL', 'dtype': str(img_array.dtype), 'count': img_array.shape[0]},
-        'bounds': None,
-        'crs': 'Not georeferenced',
-        'source': 'pil',
-        'name': uploaded_file.name
+        'array': img_array,        # (bands, h, w)
+        'display': img_display,    # (h, w, bands)
+        'name': uploaded_file.name,
+        'mode': image.mode
     }
 
 def normalize_for_display(arr):
@@ -129,7 +86,11 @@ def normalize_for_display(arr):
 
 if uploaded_file is not None:
     with st.spinner("🔄 Processing image..."):
-        data = load_image(uploaded_file)
+        try:
+            data = load_image(uploaded_file)
+        except Exception as e:
+            st.error(f"Error loading image: {e}")
+            st.stop()
     
     arr = data['array']  # (bands, h, w)
     display_img = data['display']
@@ -148,12 +109,11 @@ if uploaded_file is not None:
     with col3:
         st.metric("Bands", n_bands)
     with col4:
-        st.metric("Data Type", str(data['meta'].get('dtype', arr.dtype)))
+        st.metric("Data Type", str(arr.dtype))
     with col5:
-        st.metric("Source", data['source'].upper())
+        st.metric("Mode", data['mode'])
     
-    if data['crs'] != 'Not georeferenced':
-        st.info(f"🌍 **CRS:** {data['crs']} | **Bounds:** {data['bounds']}")
+    st.info("ℹ️ Running in **PIL-only mode** — no GDAL required. For GeoTIFF metadata, use a local Python environment with rasterio installed.")
     
     # ==================== TABS ====================
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
@@ -176,7 +136,7 @@ if uploaded_file is not None:
             if n_bands >= 3:
                 composite = st.selectbox(
                     "Color Composite",
-                    ["True Color (R-G-B)", "False Color (NIR-R-G)", "False Color (SWIR-NIR-R)", "Custom"]
+                    ["True Color (R-G-B)", "False Color (Band 3-Band 1-Band 2)", "False Color (Band 4-Band 3-Band 1)", "Custom"]
                 )
                 
                 if composite == "Custom":
@@ -185,26 +145,26 @@ if uploaded_file is not None:
                     b_band = st.selectbox("Blue Channel", range(1, n_bands+1), index=min(2, n_bands-1)) - 1
                 elif composite == "True Color (R-G-B)":
                     r_band, g_band, b_band = 0, 1, 2
-                elif composite == "False Color (NIR-R-G)":
-                    r_band, g_band, b_band = min(3, n_bands-1), 0, 1
-                else:  # SWIR-NIR-R
-                    r_band, g_band, b_band = min(4, n_bands-1), min(3, n_bands-1), 0
+                elif composite == "False Color (Band 3-Band 1-Band 2)":
+                    r_band, g_band, b_band = min(2, n_bands-1), 0, 1
+                else:  # Band 4-Band 3-Band 1
+                    r_band, g_band, b_band = min(3, n_bands-1), min(2, n_bands-1), 0
             else:
                 r_band = g_band = b_band = 0
                 composite = "Grayscale"
             
             enhance = st.checkbox("Auto-Enhance Contrast (2-98%)", value=True)
-            show_coords = st.checkbox("Show Pixel Values on Hover", value=False)
+            show_original = st.checkbox("Show Original (no enhance)", value=False)
         
         with viz_col1:
             if n_bands >= 3 and composite != "Grayscale":
                 rgb = np.stack([arr[r_band], arr[g_band], arr[b_band]], axis=-1)
-                if enhance:
+                if enhance and not show_original:
                     rgb = normalize_for_display(rgb)
                 fig = px.imshow(rgb, title=f"Composite: {composite}")
             else:
                 band_to_show = arr[0]
-                if enhance:
+                if enhance and not show_original:
                     band_to_show = normalize_for_display(band_to_show)
                 fig = px.imshow(band_to_show, color_continuous_scale='gray', title="Grayscale")
             
@@ -220,6 +180,7 @@ if uploaded_file is not None:
     with tab2:
         st.subheader("Per-Band Statistics")
         
+        import pandas as pd
         stats_data = []
         for b in range(n_bands):
             band = arr[b]
@@ -233,7 +194,6 @@ if uploaded_file is not None:
                 'Non-Zero %': round(100 * np.count_nonzero(band) / band.size, 2)
             })
         
-        import pandas as pd
         df_stats = pd.DataFrame(stats_data)
         st.dataframe(df_stats, use_container_width=True, hide_index=True)
         
@@ -302,11 +262,6 @@ if uploaded_file is not None:
         
         # Box plot
         st.markdown("**Box Plot Comparison**")
-        box_data = []
-        for b in range(n_bands):
-            band_data = arr[b].flatten()
-            box_data.append(band_data)
-        
         fig_box = go.Figure()
         for b in range(n_bands):
             fig_box.add_trace(go.Box(
@@ -333,7 +288,7 @@ if uploaded_file is not None:
             with idx_col1:
                 st.markdown("**NDVI (Normalized Difference Vegetation Index)**")
                 red_band = st.selectbox("Red Band", range(1, n_bands+1), index=0) - 1
-                nir_band = st.selectbox("NIR Band", range(1, n_bands+1), index=min(3, n_bands-1)) - 1
+                nir_band = st.selectbox("NIR Band", range(1, n_bands+1), index=min(1, n_bands-1)) - 1
                 
                 red = arr[red_band].astype(np.float32)
                 nir = arr[nir_band].astype(np.float32)
@@ -357,9 +312,7 @@ if uploaded_file is not None:
                 st.metric("Average NDVI", f"{ndvi_mean:.3f}", ndvi_health)
             
             with idx_col2:
-                st.markdown("**Other Indices**")
-                
-                # NDWI (Water)
+                st.markdown("**NDWI (Water Index)**")
                 if n_bands >= 2:
                     green_band = st.selectbox("Green Band (for NDWI)", range(1, n_bands+1), index=min(1, n_bands-1)) - 1
                     green = arr[green_band].astype(np.float32)
@@ -377,7 +330,7 @@ if uploaded_file is not None:
                 
                 # Custom Index
                 st.markdown("**🧪 Custom Index Calculator**")
-                num_band = st.selectbox("Numerator Band", range(1, n_bands+1), index=min(3, n_bands-1)) - 1
+                num_band = st.selectbox("Numerator Band", range(1, n_bands+1), index=min(1, n_bands-1)) - 1
                 den_band = st.selectbox("Denominator Band", range(1, n_bands+1), index=0) - 1
                 
                 num = arr[num_band].astype(np.float32)
@@ -399,12 +352,11 @@ if uploaded_file is not None:
         prof_col1, prof_col2 = st.columns([1, 3])
         
         with prof_col1:
-            st.markdown("**Click a point on the image** or enter coordinates:")
+            st.markdown("**Enter coordinates:**")
             x_coord = st.number_input("X Coordinate", min_value=0, max_value=width-1, value=width//2)
             y_coord = st.number_input("Y Coordinate", min_value=0, max_value=height-1, value=height//2)
             
-            # Also allow clicking on a small preview
-            st.markdown("**Pixel Value Preview**")
+            st.markdown("**Pixel Values**")
             pixel_vals = [arr[b, y_coord, x_coord] for b in range(n_bands)]
             for b, val in enumerate(pixel_vals):
                 st.text(f"Band {b+1}: {val}")
@@ -447,7 +399,6 @@ if uploaded_file is not None:
         n_samples = sampled.shape[1] * sampled.shape[2]
         spectral_matrix = sampled.reshape(n_bands, n_samples).T  # (samples, bands)
         
-        # Show first 500 samples
         fig_heatmap = px.imshow(
             spectral_matrix[:500],
             labels=dict(x="Band", y="Pixel Sample", color="Value"),
@@ -466,8 +417,8 @@ else:
         
         st.markdown("""
         **Supported Features:**
-        - 📤 Upload GeoTIFF, PNG, or JPG satellite imagery
-        - 🖼️ Interactive image viewer with true/false color composites
+        - 📤 Upload PNG, JPG, or TIFF satellite imagery
+        - 🖼️ Interactive viewer with true/false color composites
         - 📊 Per-band statistics (min, max, mean, std)
         - 📉 Histograms and box plots
         - 🌿 NDVI and NDWI vegetation/water indices
